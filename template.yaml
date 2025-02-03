@@ -1,0 +1,268 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Chatbot Stack - Creates a weather+jokes chatbot using Lambda, API Gateway, DynamoDB, and S3
+
+Parameters:
+  OpenWeatherApiKey:
+    Type: String
+    Description: API key for OpenWeatherMap
+
+Resources:
+  ####################################################
+  # 1. IAM Role for Lambda
+  ####################################################
+  ChatbotLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      RoleName: ChatbotLambdaExecutionRole
+      Policies:
+        - PolicyName: DynamoDBWriteAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Scan
+                  - dynamodb:Query
+                Resource: !GetAtt ChatbotLogsTable.Arn
+
+  ####################################################
+  # 2. DynamoDB Table
+  ####################################################
+  ChatbotLogsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: ChatbotLogs
+      AttributeDefinitions:
+        - AttributeName: RequestId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: RequestId
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  ####################################################
+  # 3. S3 Bucket
+  ####################################################
+  ChatbotDocsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: chatbot-docs-bucket-123456 # Adjust to unique name if needed
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  ####################################################
+  # 4. Lambda Function
+  ####################################################
+  ChatbotLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ChatbotLambda
+      Runtime: python3.9
+      # We'll call the code 'index.lambda_handler' because it's inlined
+      Handler: index.lambda_handler
+      Role: !GetAtt ChatbotLambdaRole.Arn
+      Timeout: 10 # Increase Lambda timeout to 10 seconds
+      Environment:
+        Variables:
+          OPENWEATHER_API_KEY: !Ref OpenWeatherApiKey
+          LOGS_TABLE_NAME: !Ref ChatbotLogsTable
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import uuid
+          import boto3
+          import urllib.request
+          import urllib.error
+          from datetime import datetime
+
+          def lambda_handler(event, context):
+            """
+            Entry point for AWS Lambda.
+            Expects a JSON payload with a 'query' key in event['body'].
+            Determines if the query is about weather or jokes.
+            """
+            weather_api_key = os.environ["OPENWEATHER_API_KEY"]
+            logs_table_name = os.environ["LOGS_TABLE_NAME"]
+
+            # Initialize DynamoDB
+            dynamodb = boto3.resource('dynamodb')
+            table = dynamodb.Table(logs_table_name)
+
+            # Parse the request body safely
+            body = event.get('body', '{}')
+
+            if isinstance(body, str):
+                body = json.loads(body)  # Only parse if it's a string
+
+            user_query = body.get('query', '').lower()
+
+            # Decide action
+            if 'weather' in user_query:
+                city = extract_city(user_query)
+                result = get_weather_info(city, weather_api_key)
+            elif 'joke' in user_query:
+                result = get_random_joke()
+            else:
+                result = "I can tell you the weather or a joke! Try asking about weather or jokes."
+
+            # Log to DynamoDB
+            request_id = str(uuid.uuid4())
+            timestamp = datetime.utcnow().isoformat()
+            table.put_item(
+                Item={
+                    'RequestId': request_id,
+                    'Query': user_query,
+                    'Response': result,
+                    'Timestamp': timestamp
+                }
+            )
+
+            # Return response
+            response_body = {
+                'requestId': request_id,
+                'response': result
+            }
+
+            return {
+                'statusCode': 200,
+                'body': json.dumps(response_body),
+                'headers': {
+                    'Content-Type': 'application/json'
+                }
+            }
+
+
+          def extract_city(user_query):
+              """
+              Pull a city name from the query. If no city found, default to 'New York'.
+              """
+              words = user_query.split()
+              if 'in' in words:
+                  idx = words.index('in')
+                  if idx + 1 < len(words):
+                      return words[idx + 1]
+              return "New York"
+
+          def get_weather_info(city, api_key):
+              """
+              Use urllib to fetch weather info from OpenWeatherMap.
+              """
+              base_url = f"https://api.openweathermap.org/data/2.5/weather?q={city}&appid={api_key}&units=metric"
+              try:
+                  with urllib.request.urlopen(base_url) as response:
+                      data = json.loads(response.read())
+                      if response.status == 200:
+                          city_name = data['name']
+                          temp = data['main']['temp']
+                          desc = data['weather'][0]['description']
+                          return f"The weather in {city_name} is {temp}°C with {desc}."
+                      else:
+                          return "Sorry, I couldn't get the weather right now."
+              except urllib.error.URLError as e:
+                  return f"Error fetching weather data: {str(e)}"
+              except Exception as e:
+                  return f"Error: {str(e)}"
+
+          def get_random_joke():
+              """
+              Use urllib to fetch a random joke from icanhazdadjoke.com
+              """
+              req = urllib.request.Request(
+                  url="https://icanhazdadjoke.com/",
+                  headers = {
+                                "Accept": "application/json",
+                                "User-Agent": "AWS Lambda Chatbot (test@example.com)"
+                            }
+              )
+              try:
+                  with urllib.request.urlopen(req) as response:
+                      data = json.loads(response.read())
+                      return data.get('joke', "Hmm, I couldn't find a joke right now!")
+              except urllib.error.URLError as e:
+                  return f"Error fetching a joke: {str(e)}"
+              except Exception as e:
+                  return f"Error: {str(e)}"
+
+  ####################################################
+  # 5. API Gateway
+  ####################################################
+  ChatbotApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: ChatbotApi
+
+  ChatbotApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ChatbotApi
+      ParentId: !GetAtt ChatbotApi.RootResourceId
+      PathPart: chatbot
+
+  ChatbotApiMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      HttpMethod: POST
+      ResourceId: !Ref ChatbotApiResource
+      RestApiId: !Ref ChatbotApi
+      AuthorizationType: NONE
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS
+        Uri:
+          Fn::Sub:
+            - arn:aws:apigateway:${Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+            - {
+                Region: !Ref "AWS::Region",
+                LambdaArn: !GetAtt ChatbotLambdaFunction.Arn,
+              }
+        IntegrationResponses:
+          - StatusCode: 200
+        RequestTemplates:
+          application/json: '{ "body" : $input.body }'
+      MethodResponses:
+        - StatusCode: 200
+
+  ChatbotApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: ChatbotApiMethod
+    Properties:
+      RestApiId: !Ref ChatbotApi
+      StageName: prod
+
+  ####################################################
+  # 6. Lambda Permission for API Gateway
+  ####################################################
+  ChatbotLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ChatbotLambdaFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn:
+        Fn::Sub: arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ChatbotApi}/*/POST/chatbot
+
+Outputs:
+  ApiEndpoint:
+    Description: "Invoke URL for Chatbot"
+    Value: !Sub "https://${ChatbotApi}.execute-api.${AWS::Region}.amazonaws.com/prod/chatbot"
+
+  S3BucketName:
+    Description: "S3 Bucket for documentation"
+    Value: !Ref ChatbotDocsBucket
